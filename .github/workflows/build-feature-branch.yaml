@@ -1,0 +1,167 @@
+# GitHub Action for Feature Branch Docker Builds
+# Builds and pushes Docker images for feature branch development
+
+name: Build Feature Branch Docker
+
+on:
+  push:
+    branches:
+      - 'feature/*'
+  pull_request:
+    branches:
+      - 'feature/*'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force rebuild even without changes'
+        required: false
+        default: false
+        type: boolean
+
+# Environment variables for Docker registry and image naming
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: docbobo/roon-extension-denon
+
+jobs:
+  build-feature-branch:
+    name: Build Feature Branch Docker Image
+    runs-on: ubuntu-latest
+    
+    # Only run on push to feature branch or manual dispatch
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    environment: production
+    permissions:
+      packages: write
+      contents: read
+      attestations: write
+      id-token: write
+      
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          
+      - name: Generate dynamic feature tag
+        id: feature-tag
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          # Convert feature/name to feature-name for Docker tag
+          FEATURE_TAG=${BRANCH_NAME//\//-}
+          echo "feature_tag=${FEATURE_TAG}" >> $GITHUB_OUTPUT
+          echo "Feature tag: ${FEATURE_TAG}"
+          
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.feature-tag.outputs.feature_tag }}
+            type=raw,value=${{ steps.feature-tag.outputs.feature_tag }}-{{sha}}
+            type=ref,event=branch,prefix=${{ steps.feature-tag.outputs.feature_tag }}-
+          labels: |
+            org.opencontainers.image.title=Roon Extension Denon (Feature Branch)
+            org.opencontainers.image.description=Roon Volume Control Extension for Denon/Marantz receivers (Feature Branch: ${{ github.ref_name }})
+            org.opencontainers.image.vendor=docbobo
+            org.opencontainers.image.url=https://github.com/docbobo/roon-extension-denon
+            
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.feature-tag.outputs.feature_tag }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: Test container startup
+        run: |
+          echo "🧪 Testing container startup..."
+          # Start container and capture output
+          CONTAINER_ID=$(docker run --rm -d ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.feature-tag.outputs.feature_tag }})
+          echo "Container ID: $CONTAINER_ID"
+          
+          # Wait for container to start
+          sleep 3
+          
+          # Check container logs for successful startup
+          if docker logs $CONTAINER_ID 2>&1 | grep -E "(Setting up sood|Starting sood)"; then
+            echo "✅ Container started successfully"
+            docker stop $CONTAINER_ID 2>/dev/null || true
+          else
+            echo "❌ Container startup test failed"
+            echo "📋 Container logs:"
+            docker logs $CONTAINER_ID 2>&1 || true
+            docker stop $CONTAINER_ID 2>/dev/null || true
+            exit 1
+          fi
+          
+      - name: Push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: Validate Docker image
+        run: |
+          echo "✅ Docker image built and pushed successfully"
+          echo "📦 Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "🏷️  Tags: ${{ steps.meta.outputs.tags }}"
+          echo "🔗 Docker Hub: https://hub.docker.com/r/${{ env.IMAGE_NAME }}/tags"
+          
+  # Optional job for pull requests - just validate build without push
+  validate-pr:
+    name: Validate PR Build
+    runs-on: ubuntu-latest
+    
+    if: github.event_name == 'pull_request'
+    
+    permissions:
+      contents: read
+      
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:pr-${{ github.event.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+      - name: Validate PR build
+        run: |
+          echo "✅ PR build validation completed"
+          echo "🔍 Build tested for platforms: linux/amd64,linux/arm64"
+          echo "📋 Ready for feature branch merge"

@@ -15,7 +15,7 @@ var denon = {};
 var roon = new RoonApi({
     extension_id: "org.pruessmann.roon.denon",
     display_name: "Denon/Marantz AVR",
-    display_version: "2025.1.2",
+    display_version: "2025.8.0",
     publisher: "Doc Bobo",
     email: "docbobo@pm.me",
     website: "https://github.com/docbobo/roon-extension-denon",
@@ -24,6 +24,8 @@ var roon = new RoonApi({
 var mysettings = roon.load_config("settings") || {
     hostname: "",
     setsource: "",
+    zone: "main",
+    powerOffBothZones: true,
 };
 
 function make_layout(settings) {
@@ -40,6 +42,29 @@ function make_layout(settings) {
         maxlength: 256,
         setting: "hostname",
     });
+    
+    l.layout.push({
+        type: "dropdown",
+        title: "Zone",
+        subtitle: "Select which zone to control. Note: Zone 2 supports power control only, not volume control.",
+        values: [
+            { title: "Main Zone", value: "main" },
+            { title: "Zone 2 (Power Only)", value: "zone2" }
+        ],
+        setting: "zone",
+    });
+    
+    l.layout.push({
+        type: "dropdown",
+        title: "Power Off Behavior",
+        subtitle: "When powering off, turn off both zones or just the selected zone",
+        values: [
+            { title: "Turn off both zones", value: true },
+            { title: "Turn off selected zone only", value: false }
+        ],
+        setting: "powerOffBothZones",
+    });
+    
     if (settings.err) {
         l.has_error = true;
         l.layout.push({
@@ -77,11 +102,15 @@ var svc_settings = new RoonApiSettings(roon, {
             if (!l.has_error && !isdryrun) {
                 var old_hostname = mysettings.hostname;
                 var old_setsource = mysettings.setsource;
+                var old_zone = mysettings.zone;
+                var old_powerOffBothZones = mysettings.powerOffBothZones;
                 mysettings = l.values;
                 svc_settings.update_settings(l);
                 if (
                     old_hostname != mysettings.hostname ||
-                    old_setsource != mysettings.setsource
+                    old_setsource != mysettings.setsource ||
+                    old_zone != mysettings.zone ||
+                    old_powerOffBothZones != mysettings.powerOffBothZones
                 )
                     setup_denon_connection(mysettings.hostname);
                 roon.save_config("settings", mysettings);
@@ -257,6 +286,26 @@ function setup_denon_connection(host) {
             }
         });
 
+        denon.client.on("zone2Changed", (val) => {
+            debug("zone2Changed: val=%s", val);
+            
+            if (mysettings.zone === "zone2") {
+                let old_power_value = denon.source_state.Power;
+                denon.source_state.Power = (val === Denon.Options.Zone2Options.On) ? "ON" : "STANDBY";
+                
+                if (old_power_value != denon.source_state.Power) {
+                    let stat = check_status(
+                        denon.source_state.Power,
+                        denon.source_state.Input,
+                    );
+                    debug("Zone2 power differs - updating");
+                    if (denon.source_control) {
+                        denon.source_control.update_state({ status: stat });
+                    }
+                }
+            }
+        });
+
         denon.keepalive = setInterval(() => {
             // Make regular calls to getBrightness for keep-alive.
             denon.client.getBrightness().then((val) => {
@@ -271,20 +320,27 @@ function setup_denon_connection(host) {
 function connect() {
     denon.client
         .connect()
-        .then(() => create_volume_control(denon))
+        .then(() => {
+            // Only create volume control for Main Zone
+            if (mysettings.zone === "main") {
+                return create_volume_control(denon);
+            } else {
+                return Promise.resolve();
+            }
+        })
         .then(() =>
             mysettings.setsource
                 ? create_source_control(denon)
                 : Promise.resolve(),
         )
         .then(() => {
-            svc_status.set_status("Connected to receiver", false);
+            const zoneInfo = mysettings.zone === "zone2" ? " (Zone 2 - Power Only)" : "";
+            svc_status.set_status("Connected to receiver" + zoneInfo, false);
         })
         .catch((error) => {
             debug("setup_denon_connection: Error during setup. Retrying...");
 
-            // TODO: Fix error message
-            console.log(error);
+            debug("Connection error during setup: %O", error);
             svc_status.set_status("Could not connect receiver: " + error, true);
         });
 }
@@ -304,11 +360,53 @@ function check_status(power, input) {
     return stat;
 }
 
+// Zone-specific helper functions
+function getPowerForZone() {
+    if (mysettings.zone === "zone2") {
+        return denon.client.getZone2().then(status => {
+            return (status === Denon.Options.Zone2Options.On) ? "ON" : "STANDBY";
+        });
+    } else {
+        return denon.client.getPower();
+    }
+}
+
+function setPowerForZone(powerState) {
+    if (mysettings.zone === "zone2") {
+        const zone2State = (powerState === "ON") ? 
+            Denon.Options.Zone2Options.On : 
+            Denon.Options.Zone2Options.Off;
+        return denon.client.setZone2(zone2State);
+    } else {
+        return denon.client.setPower(powerState);
+    }
+}
+
+function setPowerBothZones(powerState) {
+    debug("setPowerBothZones: powerState=%s", powerState);
+    
+    if (mysettings.powerOffBothZones && powerState === "STANDBY") {
+        // Turn off both zones when powering off
+        const mainZonePromise = denon.client.setPower("STANDBY");
+        const zone2Promise = denon.client.setZone2(Denon.Options.Zone2Options.Off);
+        
+        return Promise.all([mainZonePromise, zone2Promise]).then(() => {
+            debug("Both zones powered off successfully");
+        }).catch(error => {
+            debug("Error powering off both zones: %O", error);
+            throw error;
+        });
+    } else {
+        // Use zone-specific power control
+        return setPowerForZone(powerState);
+    }
+}
+
 function create_volume_control(denon) {
     debug("create_volume_control: volume_control=%o", denon.volume_control);
     if (!denon.volume_control) {
         denon.volume_state = {
-            display_name: "Main Zone",
+            display_name: mysettings.zone === "zone2" ? "Zone 2" : "Main Zone",
             volume_type: "db",
             volume_min: -79.5,
             volume_step: 0.5,
@@ -335,9 +433,7 @@ function create_volume_control(denon) {
                         req.send_complete("Success");
                     })
                     .catch((error) => {
-                        debug("set_volume: Failed with error.");
-
-                        console.log(error);
+                        debug("set_volume: Failed with error: %O", error);
                         req.send_complete("Failed");
                     });
             },
@@ -357,9 +453,7 @@ function create_volume_control(denon) {
                         req.send_complete("Success");
                     })
                     .catch((error) => {
-                        debug("set_mute: Failed.");
-
-                        console.log(error);
+                        debug("set_mute: Failed with error: %O", error);
                         req.send_complete("Failed");
                     });
             },
@@ -391,7 +485,7 @@ function create_source_control(denon) {
     debug("create_source_control: source_control=%o", denon.source_control);
     if (!denon.source_control) {
         denon.source_state = {
-            display_name: "Main Zone",
+            display_name: mysettings.zone === "zone2" ? "Zone 2" : "Main Zone",
             supports_standby: true,
             status: "",
             Power: "",
@@ -404,7 +498,7 @@ function create_source_control(denon) {
 
             convenience_switch: function (req) {
                 if (denon.source_state.Power === "STANDBY") {
-                    denon.client.setPower("ON");
+                    setPowerForZone("ON");
                 }
 
                 if (denon.source_state.Input == mysettings.setsource) {
@@ -421,17 +515,15 @@ function create_source_control(denon) {
                         });
                 }
             },
-            standby: function(req) {
-                denon.client.getPower().then((val) => {
-                    denon.client
-                        .setPower(val === "STANDBY" ? "ON" : "STANDBY")
+            standby: function (req) {
+                getPowerForZone().then((val) => {
+                    const newPowerState = val === "STANDBY" ? "ON" : "STANDBY";
+                    setPowerBothZones(newPowerState)
                         .then(() => {
                             req.send_complete("Success");
                         })
                         .catch((error) => {
-                            debug("set_standby: Failed with error.");
-
-                            console.log(error);
+                            debug("set_standby: Failed with error: %O", error);
                             req.send_complete("Failed");
                         });
                 });
@@ -439,8 +531,7 @@ function create_source_control(denon) {
         };
     }
 
-    let result = denon.client
-        .getPower()
+    let result = getPowerForZone()
         .then((val) => {
             denon.source_state.Power = val;
             return denon.client.getInput();
